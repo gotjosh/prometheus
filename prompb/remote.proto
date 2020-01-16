@@ -21,6 +21,7 @@ import "gogoproto/gogo.proto";
 
 message WriteRequest {
   repeated prometheus.TimeSeries timeseries = 1 [(gogoproto.nullable) = false];
+  repeated prometheus.MetricMetadata metadata = 2 [(gogoproto.nullable) = false];
 }
 
 // ReadRequest represents a remote read request.

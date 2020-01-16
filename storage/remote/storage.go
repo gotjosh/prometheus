@@ -29,6 +29,7 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/logging"
+	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
 )
 
@@ -151,6 +152,10 @@ func (s *Storage) Querier(ctx context.Context, mint, maxt int64) (storage.Querie
 // Appender implements storage.Storage.
 func (s *Storage) Appender() (storage.Appender, error) {
 	return s.rws.Appender()
+}
+
+func (s *Storage) MetadataAppender() (scrape.MetricMetadataAppender, error) {
+	return s.rws.MetadataAppender()
 }
 
 // Close the background processing of the storage queues.

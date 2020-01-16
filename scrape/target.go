@@ -80,6 +80,10 @@ type MetricMetadataStore interface {
 	GetMetadata(metric string) (MetricMetadata, bool)
 }
 
+type MetricMetadataAppender interface {
+	Set(l *Target, m []MetricMetadata)
+}
+
 // MetricMetadata is a piece of metadata for a metric.
 type MetricMetadata struct {
 	Metric string

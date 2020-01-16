@@ -18,6 +18,31 @@ option go_package = "prompb";
 
 import "gogoproto/gogo.proto";
 
+message MetricMetadata {
+  enum MetricType {
+    Counter        = 0;
+    Gauge          = 1;
+    Histogram      = 2;
+    GaugeHistogram = 3;
+    Summary        = 4;
+    Info           = 5;
+    Stateset       = 6;
+    Unknown        = 7;
+  }
+
+  // Set of targets
+  repeated Target targets = 1 [(gogoproto.nullable) = false];
+
+  MetricType type = 2;
+  string metric = 3;
+  string help = 4;
+  string unit = 5;
+}
+
+message Target {
+  Labels labels = 1 [(gogoproto.nullable) = false];
+}
+
 message Sample {
   double value    = 1;
   int64 timestamp = 2;

@@ -38,13 +38,18 @@ type Appendable interface {
 	Appender() (storage.Appender, error)
 }
 
+type MetadataAppendable interface {
+	MetadataAppender() (MetricMetadataAppender, error)
+}
+
 // NewManager is the Manager constructor
-func NewManager(logger log.Logger, app Appendable) *Manager {
+func NewManager(logger log.Logger, app Appendable, mapp MetadataAppendable) *Manager {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
 	return &Manager{
 		append:        app,
+		mappend:       mapp,
 		logger:        logger,
 		scrapeConfigs: make(map[string]*config.ScrapeConfig),
 		scrapePools:   make(map[string]*scrapePool),
@@ -58,6 +63,7 @@ func NewManager(logger log.Logger, app Appendable) *Manager {
 type Manager struct {
 	logger    log.Logger
 	append    Appendable
+	mappend   MetadataAppendable
 	graceShut chan struct{}
 
 	jitterSeed    uint64     // Global jitterSeed seed is used to spread scrape workload across HA setup.
@@ -118,7 +124,7 @@ func (m *Manager) reload() {
 				level.Error(m.logger).Log("msg", "error reloading target set", "err", "invalid config id:"+setName)
 				continue
 			}
-			sp, err := newScrapePool(scrapeConfig, m.append, m.jitterSeed, log.With(m.logger, "scrape_pool", setName))
+			sp, err := newScrapePool(scrapeConfig, m.append, m.mappend, m.jitterSeed, log.With(m.logger, "scrape_pool", setName))
 			if err != nil {
 				level.Error(m.logger).Log("msg", "error creating new scrape pool", "err", err, "scrape_pool", setName)
 				continue

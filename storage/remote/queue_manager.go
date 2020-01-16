@@ -31,7 +31,9 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/wal"
 )
@@ -203,6 +205,7 @@ type QueueManager struct {
 	watcher        *wal.Watcher
 
 	seriesMtx            sync.Mutex
+	metaMtx              sync.Mutex
 	seriesLabels         map[uint64]labels.Labels
 	seriesSegmentIndexes map[uint64]int
 	droppedSeries        map[uint64]struct{}
@@ -264,6 +267,32 @@ func NewQueueManager(reg prometheus.Registerer, logger log.Logger, walDir string
 	t.shards = t.newShards()
 
 	return t
+}
+
+func (t *QueueManager) AppendMeta(target *scrape.Target, meta []scrape.MetricMetadata) bool {
+outer:
+	for _, m := range meta {
+		level.Info(t.logger).Log("msg", "sending metric", "metric", m.Metric)
+		backoff := t.cfg.MinBackoff
+		for {
+			select {
+			case <-t.quit:
+				return false
+			default:
+			}
+
+			if t.shards.enqueueMeta(target, m) {
+				continue outer
+			}
+
+			time.Sleep(time.Duration(backoff))
+			backoff = backoff * 2
+			if backoff > t.cfg.MaxBackoff {
+				backoff = t.cfg.MaxBackoff
+			}
+		}
+	}
+	return true
 }
 
 // Append queues a sample to be sent to the remote storage. Blocks until all samples are
@@ -343,6 +372,11 @@ func (t *QueueManager) Start() {
 	t.minNumShards.Set(float64(t.cfg.MinShards))
 	t.desiredNumShards.Set(float64(t.cfg.MinShards))
 
+	// TODO: Include the metadata shards here.
+	// Set up a single shard to test the rate at which we send metadata to the requests
+	// Istrument: No. of targets, rate, size, etc.
+	// We need the number of pending metadata to send and it should be closing to 0 over time.
+	// Top of the list: Track the rate at which metadata is coming in.
 	t.shards.start(t.numShards)
 	t.watcher.Start()
 
@@ -623,11 +657,21 @@ type sample struct {
 	v      float64
 }
 
-type shards struct {
-	mtx sync.RWMutex // With the WAL, this is never actually contended.
+type metadata struct {
+	// Don't use scrape.target here
+	metric string
+	typ    textparse.MetricType
+	help   string
+	unit   string
+}
 
-	qm     *QueueManager
-	queues []chan sample
+type shards struct {
+	mtx     sync.RWMutex // With the WAL, this is never actually contended.
+	metaMtx sync.RWMutex
+
+	qm        *QueueManager
+	queues    []chan sample
+	metaQueue chan map[metadata]*scrape.Target
 
 	// Emulate a wait group with a channel and an atomic int, as you
 	// cannot select on a wait group.
@@ -654,13 +698,21 @@ func (s *shards) start(n int) {
 
 	s.queues = newQueues
 
+	// newMetadataQueue := make([]chan map[string]metaEntry, s.qm.cfg.Capacity)
+	// for i := 0; i < n; i++ {
+	// 	newMetadataQueue[i] = make(chan map[string]metaEntry, s.qm.cfg.Capacity)
+	// }
+
+	newMetadataQueue := make(chan map[metadata]*scrape.Target)
+	s.metaQueue = newMetadataQueue
+
 	var hardShutdownCtx context.Context
 	hardShutdownCtx, s.hardShutdown = context.WithCancel(context.Background())
 	s.softShutdown = make(chan struct{})
 	s.running = int32(n)
 	s.done = make(chan struct{})
 	for i := 0; i < n; i++ {
-		go s.runShard(hardShutdownCtx, i, newQueues[i])
+		go s.runShard(hardShutdownCtx, i, newQueues[i], newMetadataQueue)
 	}
 	s.qm.numShardsMetric.Set(float64(n))
 }
@@ -683,6 +735,9 @@ func (s *shards) stop() {
 	for _, queue := range s.queues {
 		close(queue)
 	}
+
+	close(s.metaQueue)
+
 	select {
 	case <-s.done:
 		return
@@ -693,6 +748,24 @@ func (s *shards) stop() {
 	// Force an unclean shutdown.
 	s.hardShutdown()
 	<-s.done
+}
+
+func (s *shards) enqueueMeta(target *scrape.Target, meta scrape.MetricMetadata) bool {
+	s.metaMtx.RLock()
+	defer s.metaMtx.RUnlock()
+
+	select {
+	case <-s.softShutdown:
+		return false
+	default:
+	}
+
+	select {
+	case <-s.softShutdown:
+		return false
+	case s.metaQueue <- map[metadata]*scrape.Target{metadata{metric: meta.Metric, help: meta.Help, typ: meta.Type, unit: meta.Unit}: target}:
+		return true
+	}
 }
 
 // enqueue a sample.  If we are currently in the process of shutting down or resharding,
@@ -716,7 +789,7 @@ func (s *shards) enqueue(ref uint64, sample sample) bool {
 	}
 }
 
-func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
+func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample, metaQueue chan map[metadata]*scrape.Target) {
 	defer func() {
 		if atomic.AddInt32(&s.running, -1) == 0 {
 			close(s.done)
@@ -729,10 +802,11 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 	// If we have fewer samples than that, flush them out after a deadline
 	// anyways.
 	var (
-		max            = s.qm.cfg.MaxSamplesPerSend
-		nPending       = 0
-		pendingSamples = allocateTimeSeries(max)
-		buf            []byte
+		max             = s.qm.cfg.MaxSamplesPerSend
+		nPending        = 0
+		pendingMetadata = map[metadata]map[*scrape.Target]struct{}{}
+		pendingSamples  = allocateTimeSeries(max)
+		buf             []byte
 	)
 
 	timer := time.NewTimer(time.Duration(s.qm.cfg.BatchSendDeadline))
@@ -751,11 +825,33 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 		case <-ctx.Done():
 			return
 
+		case metaWithTarget, ok := <-metaQueue:
+			if !ok {
+				//TODO: Turning on metadata will only result on an X amount of bump into the shards.
+				//TODO: Check size of metadata for a single series on a single target. That would give us an idea.
+				// level.Error(s.qm.logger).Log("msg", "failed to send metadata", "entry", metaWithTarget.metric)
+				return
+			}
+
+			for m, t := range metaWithTarget {
+				mm, ok := pendingMetadata[m]
+				if !ok {
+					mm = map[*scrape.Target]struct{}{}
+				}
+				mm[t] = struct{}{}
+			}
+			// pendingSamples[nPending].Labels = labelsToLabelsProto(sample.labels, pendingSamples[nPending].Labels)
+			// pendingSamples[nPending].Samples[0].Timestamp = sample.t
+			// pendingSamples[nPending].Samples[0].Value = sample.v
+			// nPending++
+			// s.qm.pendingSamplesMetric.Inc()
+			// level.Info(s.qm.logger).Log("msg", "sending metadata", "labels", metaWithTarget.target.String(), "metric", metaWithTarget.metric)
+
 		case sample, ok := <-queue:
 			if !ok {
 				if nPending > 0 {
 					level.Debug(s.qm.logger).Log("msg", "Flushing samples to remote storage...", "count", nPending)
-					s.sendSamples(ctx, pendingSamples[:nPending], &buf)
+					s.sendSamples(ctx, pendingSamples[:nPending], pendingMetadata, &buf)
 					s.qm.pendingSamplesMetric.Sub(float64(nPending))
 					level.Debug(s.qm.logger).Log("msg", "Done flushing.")
 				}
@@ -772,7 +868,7 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 			s.qm.pendingSamplesMetric.Inc()
 
 			if nPending >= max {
-				s.sendSamples(ctx, pendingSamples, &buf)
+				s.sendSamples(ctx, pendingSamples, pendingMetadata, &buf)
 				nPending = 0
 				s.qm.pendingSamplesMetric.Sub(float64(max))
 
@@ -783,7 +879,7 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 		case <-timer.C:
 			if nPending > 0 {
 				level.Debug(s.qm.logger).Log("msg", "runShard timer ticked, sending samples", "samples", nPending, "shard", shardNum)
-				s.sendSamples(ctx, pendingSamples[:nPending], &buf)
+				s.sendSamples(ctx, pendingSamples[:nPending], pendingMetadata, &buf)
 				nPending = 0
 				s.qm.pendingSamplesMetric.Sub(float64(nPending))
 			}
@@ -792,9 +888,9 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 	}
 }
 
-func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, buf *[]byte) {
+func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, meta map[metadata]map[*scrape.Target]struct{}, buf *[]byte) {
 	begin := time.Now()
-	err := s.sendSamplesWithBackoff(ctx, samples, buf)
+	err := s.sendSamplesWithBackoff(ctx, samples, meta, buf)
 	if err != nil {
 		level.Error(s.qm.logger).Log("msg", "non-recoverable error", "count", len(samples), "err", err)
 		s.qm.failedSamplesTotal.Add(float64(len(samples)))
@@ -807,9 +903,9 @@ func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, b
 }
 
 // sendSamples to the remote storage with backoff for recoverable errors.
-func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.TimeSeries, buf *[]byte) error {
+func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.TimeSeries, meta map[metadata]map[*scrape.Target]struct{}, buf *[]byte) error {
 	backoff := s.qm.cfg.MinBackoff
-	req, highest, err := buildWriteRequest(samples, *buf)
+	req, highest, err := buildWriteRequest(samples, meta, *buf)
 	*buf = req
 	if err != nil {
 		// Failing to build the write request is non-recoverable, since it will
@@ -850,7 +946,16 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.Ti
 	}
 }
 
-func buildWriteRequest(samples []prompb.TimeSeries, buf []byte) ([]byte, int64, error) {
+// Always send all the targets. Please always check that this is not a ridciously amount of data over the wire.
+// 1. Optimise for sending the metadata per target. Meaning you'd always get a chunk of the data from a given target
+// 2. Optimise for sending metadata as it in queued. By collecting the data from a target and then queueing it over.
+// 3. Optimise for sending the medata attached to a given time series / metric.
+// Only look at this as an optimise.
+// 4. Build a cache of metadata for remote-write that keep tracks. As a different Request.
+// ref -> target
+// ref -> metadata
+
+func buildWriteRequest(samples []prompb.TimeSeries, meta map[metadata]map[*scrape.Target]struct{}, buf []byte) ([]byte, int64, error) {
 	var highest int64
 	for _, ts := range samples {
 		// At the moment we only ever append a TimeSeries with a single sample in it.
@@ -858,8 +963,30 @@ func buildWriteRequest(samples []prompb.TimeSeries, buf []byte) ([]byte, int64, 
 			highest = ts.Samples[0].Timestamp
 		}
 	}
+
+	metadata := make([]prompb.MetricMetadata, len(meta))
+	for m, t := range meta {
+		var targets []prompb.Target
+
+		for ct, _ := range t {
+			labels := make([]prompb.Label, len(ct.Labels()))
+			targets = append(targets, prompb.Target{
+				Labels: prompb.Labels{Labels: labelsToLabelsProto(ct.Labels(), labels)},
+			})
+		}
+
+		metadata = append(metadata, prompb.MetricMetadata{
+			Metric:  m.metric,
+			Help:    m.help,
+			Type:    prompb.MetricMetadata_Counter, // Make them all counters until we write the conversion
+			Unit:    m.unit,
+			Targets: targets,
+		})
+	}
+
 	req := &prompb.WriteRequest{
 		Timeseries: samples,
+		Metadata:   metadata,
 	}
 
 	data, err := proto.Marshal(req)

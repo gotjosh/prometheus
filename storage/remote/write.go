@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
 )
 
@@ -184,6 +185,12 @@ func (rws *WriteStorage) Appender() (storage.Appender, error) {
 	}, nil
 }
 
+func (rws *WriteStorage) MetadataAppender() (scrape.MetricMetadataAppender, error) {
+	return &writeMetadataStorage{
+		writeStorage: rws,
+	}, nil
+}
+
 // Close closes the WriteStorage.
 func (rws *WriteStorage) Close() error {
 	rws.mtx.Lock()
@@ -192,6 +199,30 @@ func (rws *WriteStorage) Close() error {
 		q.Stop()
 	}
 	return nil
+}
+
+type writeMetadataStorage struct {
+	writeStorage *WriteStorage
+}
+
+func (ms *writeMetadataStorage) Set(target *scrape.Target, metadata []scrape.MetricMetadata) {
+	level.Info(ms.writeStorage.logger).Log("msg", "starting to queue metadata")
+
+	for hash, queue := range ms.writeStorage.queues {
+		level.Info(ms.writeStorage.logger).Log("msg", "queueing metadata", "queue", hash)
+
+		if ok := queue.AppendMeta(target, metadata); !ok {
+			level.Info(ms.writeStorage.logger).Log("msg", "couldnt send to the queue", "queue", hash)
+		}
+	}
+
+	// if !ok {
+	// 	level.Info(ms.writeStorage.logger).Log("msg", "queue is not ready", "queue_len", len(ms.writeStorage.queues), "config_hash", ms.writeStorage.configHash)
+	// 	level.Info(ms.writeStorage.logger).Log("queue", ms.writeStorage.queues)
+	// 	return
+	// }
+
+	// queue.AppendMeta(target, metadata)
 }
 
 type timestampTracker struct {

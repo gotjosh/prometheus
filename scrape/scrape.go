@@ -152,8 +152,9 @@ func init() {
 
 // scrapePool manages scrapes for sets of targets.
 type scrapePool struct {
-	appendable Appendable
-	logger     log.Logger
+	appendable  Appendable
+	mappendable MetadataAppendable
+	logger      log.Logger
 
 	mtx    sync.RWMutex
 	config *config.ScrapeConfig
@@ -182,7 +183,7 @@ const maxAheadTime = 10 * time.Minute
 
 type labelsMutator func(labels.Labels) labels.Labels
 
-func newScrapePool(cfg *config.ScrapeConfig, app Appendable, jitterSeed uint64, logger log.Logger) (*scrapePool, error) {
+func newScrapePool(cfg *config.ScrapeConfig, app Appendable, mapp MetadataAppendable, jitterSeed uint64, logger log.Logger) (*scrapePool, error) {
 	targetScrapePools.Inc()
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -200,6 +201,7 @@ func newScrapePool(cfg *config.ScrapeConfig, app Appendable, jitterSeed uint64, 
 	sp := &scrapePool{
 		cancel:        cancel,
 		appendable:    app,
+		mappendable:   mapp,
 		config:        cfg,
 		client:        client,
 		activeTargets: map[uint64]*Target{},
@@ -212,6 +214,7 @@ func newScrapePool(cfg *config.ScrapeConfig, app Appendable, jitterSeed uint64, 
 		opts.target.SetMetadataStore(cache)
 
 		return newScrapeLoop(
+			opts.target,
 			ctx,
 			opts.scraper,
 			log.With(logger, "target", opts.target),
@@ -227,6 +230,7 @@ func newScrapePool(cfg *config.ScrapeConfig, app Appendable, jitterSeed uint64, 
 				}
 				return appender(app, opts.limit)
 			},
+			mapp,
 			cache,
 			jitterSeed,
 			opts.honorTimestamps,
@@ -589,6 +593,7 @@ type cacheEntry struct {
 }
 
 type scrapeLoop struct {
+	target          *Target
 	scraper         scraper
 	l               log.Logger
 	cache           *scrapeCache
@@ -598,6 +603,7 @@ type scrapeLoop struct {
 	honorTimestamps bool
 
 	appender            func() storage.Appender
+	mappender           MetadataAppendable
 	sampleMutator       labelsMutator
 	reportSampleMutator labelsMutator
 
@@ -827,13 +833,16 @@ func (c *scrapeCache) ListMetadata() []MetricMetadata {
 	return res
 }
 
-func newScrapeLoop(ctx context.Context,
+func newScrapeLoop(t *Target,
+	ctx context.Context,
 	sc scraper,
 	l log.Logger,
 	buffers *pool.Pool,
 	sampleMutator labelsMutator,
 	reportSampleMutator labelsMutator,
 	appender func() storage.Appender,
+	//TODO: Maybe we need to lazy-load?
+	mappender MetadataAppendable,
 	cache *scrapeCache,
 	jitterSeed uint64,
 	honorTimestamps bool,
@@ -848,10 +857,12 @@ func newScrapeLoop(ctx context.Context,
 		cache = newScrapeCache()
 	}
 	sl := &scrapeLoop{
+		target:              t,
 		scraper:             sc,
 		buffers:             buffers,
 		cache:               cache,
 		appender:            appender,
+		mappender:           mappender,
 		sampleMutator:       sampleMutator,
 		reportSampleMutator: reportSampleMutator,
 		stopped:             make(chan struct{}),
@@ -946,6 +957,14 @@ mainLoop:
 		}
 		last = start
 
+		m, err := sl.mappender.MetadataAppender()
+		if err != nil {
+			panic(err)
+		}
+		// Now that we're done scraping. Let's append metadata to remote-write.
+		// Append metadata to remote-write
+		m.Set(sl.target, sl.cache.ListMetadata())
+
 		select {
 		case <-sl.parentCtx.Done():
 			close(sl.stopped)
@@ -959,6 +978,7 @@ mainLoop:
 	close(sl.stopped)
 
 	sl.endOfRunStaleness(last, ticker, interval)
+	// Tell remote-write we're done with scraping this target.
 }
 
 func (sl *scrapeLoop) endOfRunStaleness(last time.Time, ticker *time.Ticker, interval time.Duration) {
