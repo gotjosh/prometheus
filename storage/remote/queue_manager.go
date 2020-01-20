@@ -31,7 +31,9 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/wal"
 )
@@ -170,7 +172,34 @@ var (
 			Namespace: namespace,
 			Subsystem: subsystem,
 			Name:      "sent_bytes_total",
-			Help:      "The total number of bytes sent by the queue.",
+			Help:      "The total number of bytes sent by the queue after compression.",
+		},
+		[]string{remoteName, endpoint},
+	)
+	uncompressedBytesSent = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "uncompressed_sent_bytes_total",
+			Help:      "The total number of bytes in the queue before compression.",
+		},
+		[]string{remoteName, endpoint},
+	)
+	metadataBytesSent = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "metadata_sent_bytes_total",
+			Help:      "The total number of bytes in the queue of Metadata before compression.",
+		},
+		[]string{remoteName, endpoint},
+	)
+	timeseriesBytesSent = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "timeseries_sent_bytes_total",
+			Help:      "The total number of bytes in the queue of Timeseries before compression.",
 		},
 		[]string{remoteName, endpoint},
 	)
@@ -203,6 +232,7 @@ type QueueManager struct {
 	watcher        *wal.Watcher
 
 	seriesMtx            sync.Mutex
+	metaMtx              sync.Mutex
 	seriesLabels         map[uint64]labels.Labels
 	seriesSegmentIndexes map[uint64]int
 	droppedSeries        map[uint64]struct{}
@@ -229,6 +259,9 @@ type QueueManager struct {
 	minNumShards               prometheus.Gauge
 	desiredNumShards           prometheus.Gauge
 	bytesSent                  prometheus.Counter
+	uncompressedBytes          prometheus.Counter
+	metadataBytes              prometheus.Counter
+	timeseriesBytes            prometheus.Counter
 }
 
 // NewQueueManager builds a new QueueManager.
@@ -264,6 +297,32 @@ func NewQueueManager(reg prometheus.Registerer, logger log.Logger, walDir string
 	t.shards = t.newShards()
 
 	return t
+}
+
+func (t *QueueManager) AppendMeta(target *scrape.Target, meta []scrape.MetricMetadata) bool {
+outer:
+	for _, m := range meta {
+		t.metaMtx.Lock()
+		backoff := t.cfg.MinBackoff
+		for {
+			select {
+			case <-t.quit:
+				return false
+			default:
+			}
+
+			if t.shards.enqueueMeta(target, m) {
+				continue outer
+			}
+
+			time.Sleep(time.Duration(backoff))
+			backoff = backoff * 2
+			if backoff > t.cfg.MaxBackoff {
+				backoff = t.cfg.MaxBackoff
+			}
+		}
+	}
+	return true
 }
 
 // Append queues a sample to be sent to the remote storage. Blocks until all samples are
@@ -335,6 +394,9 @@ func (t *QueueManager) Start() {
 	t.minNumShards = minNumShards.WithLabelValues(name, ep)
 	t.desiredNumShards = desiredNumShards.WithLabelValues(name, ep)
 	t.bytesSent = bytesSent.WithLabelValues(name, ep)
+	t.uncompressedBytes = uncompressedBytesSent.WithLabelValues(name, ep)
+	t.metadataBytes = metadataBytesSent.WithLabelValues(name, ep)
+	t.timeseriesBytes = timeseriesBytesSent.WithLabelValues(name, ep)
 
 	// Initialise some metrics.
 	t.shardCapacity.Set(float64(t.cfg.Capacity))
@@ -623,11 +685,20 @@ type sample struct {
 	v      float64
 }
 
-type shards struct {
-	mtx sync.RWMutex // With the WAL, this is never actually contended.
+type metadata struct {
+	metric string
+	typ    textparse.MetricType
+	help   string
+	unit   string
+}
 
-	qm     *QueueManager
-	queues []chan sample
+type shards struct {
+	mtx     sync.RWMutex // With the WAL, this is never actually contended.
+	metaMtx sync.RWMutex
+
+	qm        *QueueManager
+	queues    []chan sample
+	metaQueue chan map[metadata]*scrape.Target
 
 	// Emulate a wait group with a channel and an atomic int, as you
 	// cannot select on a wait group.
@@ -654,13 +725,16 @@ func (s *shards) start(n int) {
 
 	s.queues = newQueues
 
+	newMetadataQueue := make(chan map[metadata]*scrape.Target)
+	s.metaQueue = newMetadataQueue
+
 	var hardShutdownCtx context.Context
 	hardShutdownCtx, s.hardShutdown = context.WithCancel(context.Background())
 	s.softShutdown = make(chan struct{})
 	s.running = int32(n)
 	s.done = make(chan struct{})
 	for i := 0; i < n; i++ {
-		go s.runShard(hardShutdownCtx, i, newQueues[i])
+		go s.runShard(hardShutdownCtx, i, newQueues[i], newMetadataQueue)
 	}
 	s.qm.numShardsMetric.Set(float64(n))
 }
@@ -683,6 +757,9 @@ func (s *shards) stop() {
 	for _, queue := range s.queues {
 		close(queue)
 	}
+
+	close(s.metaQueue)
+
 	select {
 	case <-s.done:
 		return
@@ -693,6 +770,27 @@ func (s *shards) stop() {
 	// Force an unclean shutdown.
 	s.hardShutdown()
 	<-s.done
+}
+
+func (s *shards) enqueueMeta(target *scrape.Target, meta scrape.MetricMetadata) bool {
+	s.metaMtx.RLock()
+	defer s.metaMtx.RUnlock()
+
+	select {
+	case <-s.softShutdown:
+		return false
+	default:
+	}
+
+	//TODO: Yes, there is a single shard in the queue for now.
+	// Before shipping the feature we can the hash of the labels to determine the which queue to use - similarly to the samples one.
+	select {
+	case <-s.softShutdown:
+		return false
+	case s.metaQueue <- map[metadata]*scrape.Target{metadata{metric: meta.Metric, help: meta.Help, typ: meta.Type, unit: meta.Unit}: target}:
+		//TODO: This allocation is probably unnecessary. Moreso, I think we can avoid importing the scrape package altoger by just using the label.
+		return true
+	}
 }
 
 // enqueue a sample.  If we are currently in the process of shutting down or resharding,
@@ -716,7 +814,7 @@ func (s *shards) enqueue(ref uint64, sample sample) bool {
 	}
 }
 
-func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
+func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample, metaQueue chan map[metadata]*scrape.Target) {
 	defer func() {
 		if atomic.AddInt32(&s.running, -1) == 0 {
 			close(s.done)
@@ -729,10 +827,11 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 	// If we have fewer samples than that, flush them out after a deadline
 	// anyways.
 	var (
-		max            = s.qm.cfg.MaxSamplesPerSend
-		nPending       = 0
-		pendingSamples = allocateTimeSeries(max)
-		buf            []byte
+		max             = s.qm.cfg.MaxSamplesPerSend
+		nPending        = 0
+		pendingMetadata = map[metadata]map[*scrape.Target]struct{}{}
+		pendingSamples  = allocateTimeSeries(max)
+		buf             []byte
 	)
 
 	timer := time.NewTimer(time.Duration(s.qm.cfg.BatchSendDeadline))
@@ -751,11 +850,24 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 		case <-ctx.Done():
 			return
 
+		case metaWithTarget, ok := <-metaQueue:
+			if !ok {
+				return
+			}
+
+			for m, t := range metaWithTarget {
+				mm, ok := pendingMetadata[m]
+				if !ok {
+					mm = map[*scrape.Target]struct{}{}
+				}
+				mm[t] = struct{}{}
+			}
+
 		case sample, ok := <-queue:
 			if !ok {
 				if nPending > 0 {
 					level.Debug(s.qm.logger).Log("msg", "Flushing samples to remote storage...", "count", nPending)
-					s.sendSamples(ctx, pendingSamples[:nPending], &buf)
+					s.sendSamples(ctx, pendingSamples[:nPending], pendingMetadata, &buf)
 					s.qm.pendingSamplesMetric.Sub(float64(nPending))
 					level.Debug(s.qm.logger).Log("msg", "Done flushing.")
 				}
@@ -772,7 +884,7 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 			s.qm.pendingSamplesMetric.Inc()
 
 			if nPending >= max {
-				s.sendSamples(ctx, pendingSamples, &buf)
+				s.sendSamples(ctx, pendingSamples, pendingMetadata, &buf)
 				nPending = 0
 				s.qm.pendingSamplesMetric.Sub(float64(max))
 
@@ -783,7 +895,7 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 		case <-timer.C:
 			if nPending > 0 {
 				level.Debug(s.qm.logger).Log("msg", "runShard timer ticked, sending samples", "samples", nPending, "shard", shardNum)
-				s.sendSamples(ctx, pendingSamples[:nPending], &buf)
+				s.sendSamples(ctx, pendingSamples[:nPending], pendingMetadata, &buf)
 				nPending = 0
 				s.qm.pendingSamplesMetric.Sub(float64(nPending))
 			}
@@ -792,9 +904,9 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 	}
 }
 
-func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, buf *[]byte) {
+func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, meta map[metadata]map[*scrape.Target]struct{}, buf *[]byte) {
 	begin := time.Now()
-	err := s.sendSamplesWithBackoff(ctx, samples, buf)
+	err := s.sendSamplesWithBackoff(ctx, samples, meta, buf)
 	if err != nil {
 		level.Error(s.qm.logger).Log("msg", "non-recoverable error", "count", len(samples), "err", err)
 		s.qm.failedSamplesTotal.Add(float64(len(samples)))
@@ -807,9 +919,9 @@ func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, b
 }
 
 // sendSamples to the remote storage with backoff for recoverable errors.
-func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.TimeSeries, buf *[]byte) error {
+func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.TimeSeries, meta map[metadata]map[*scrape.Target]struct{}, buf *[]byte) error {
 	backoff := s.qm.cfg.MinBackoff
-	req, highest, err := buildWriteRequest(samples, *buf)
+	req, highest, err := s.buildWriteRequest(samples, meta, *buf)
 	*buf = req
 	if err != nil {
 		// Failing to build the write request is non-recoverable, since it will
@@ -850,17 +962,51 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.Ti
 	}
 }
 
-func buildWriteRequest(samples []prompb.TimeSeries, buf []byte) ([]byte, int64, error) {
+func (s *shards) buildWriteRequest(samples []prompb.TimeSeries, meta map[metadata]map[*scrape.Target]struct{}, buf []byte) ([]byte, int64, error) {
 	var highest int64
+	var timeseriesSize, metadataSize int
 	for _, ts := range samples {
 		// At the moment we only ever append a TimeSeries with a single sample in it.
 		if ts.Samples[0].Timestamp > highest {
 			highest = ts.Samples[0].Timestamp
 		}
+
+		timeseriesSize += ts.Size()
 	}
+
+	s.qm.timeseriesBytes.Add(float64(timeseriesSize))
+
+	metadata := make([]prompb.MetricMetadata, len(meta))
+	for m, t := range meta {
+		var targets []prompb.Target
+
+		for ct := range t {
+			labels := make([]prompb.Label, len(ct.Labels()))
+			targets = append(targets, prompb.Target{
+				Labels: prompb.Labels{Labels: labelsToLabelsProto(ct.Labels(), labels)},
+			})
+		}
+
+		pbmeta := prompb.MetricMetadata{
+			Metric:  m.metric,
+			Help:    m.help,
+			Type:    prompb.MetricMetadata_Counter, // Make them all counters until we write the conversion function
+			Unit:    m.unit,
+			Targets: targets,
+		}
+
+		metadata = append(metadata, pbmeta)
+		metadataSize += pbmeta.Size()
+	}
+
+	s.qm.metadataBytes.Add(float64(metadataSize))
+
 	req := &prompb.WriteRequest{
 		Timeseries: samples,
+		Metadata:   metadata,
 	}
+
+	s.qm.uncompressedBytes.Add(float64(req.Size()))
 
 	data, err := proto.Marshal(req)
 	if err != nil {

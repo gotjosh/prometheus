@@ -19,17 +19,26 @@ import (
 )
 
 type nopAppendable struct{}
+type nopMetadataAppendable struct{}
 
 func (a nopAppendable) Appender() (storage.Appender, error) {
 	return nopAppender{}, nil
 }
 
+func (a nopMetadataAppendable) MetadataAppender() (MetricMetadataAppender, error) {
+	return nopMetadataAppender{}, nil
+}
+
 type nopAppender struct{}
+type nopMetadataAppender struct{}
 
 func (a nopAppender) Add(labels.Labels, int64, float64) (uint64, error)   { return 0, nil }
 func (a nopAppender) AddFast(labels.Labels, uint64, int64, float64) error { return nil }
 func (a nopAppender) Commit() error                                       { return nil }
 func (a nopAppender) Rollback() error                                     { return nil }
+
+func (a nopMetadataAppender) Set(t *Target, e []MetricMetadata) {}
+func (a nopMetadataAppender) Delete(t *Target, m string)        {}
 
 type sample struct {
 	metric labels.Labels
@@ -42,6 +51,19 @@ type sample struct {
 type collectResultAppender struct {
 	next   storage.Appender
 	result []sample
+}
+
+// collectMetadataAppender records all metadata that was addeded through the appender.
+type collectMetadataAppender struct {
+	entries map[*Target][]MetricMetadata
+}
+
+func (cma *collectMetadataAppender) Set(t *Target, e []MetricMetadata) {
+	cma.entries[t] = e
+}
+
+func (cma *collectMetadataAppender) Delete(t *Target, m string) {
+	//TODO: Doesn't really matter for now.
 }
 
 func (a *collectResultAppender) AddFast(m labels.Labels, ref uint64, t int64, v float64) error {

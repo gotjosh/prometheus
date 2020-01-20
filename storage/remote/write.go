@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
 )
 
@@ -184,6 +185,12 @@ func (rws *WriteStorage) Appender() (storage.Appender, error) {
 	}, nil
 }
 
+func (rws *WriteStorage) MetadataAppender() (scrape.MetricMetadataAppender, error) {
+	return &writeMetadataStorage{
+		writeStorage: rws,
+	}, nil
+}
+
 // Close closes the WriteStorage.
 func (rws *WriteStorage) Close() error {
 	rws.mtx.Lock()
@@ -192,6 +199,23 @@ func (rws *WriteStorage) Close() error {
 		q.Stop()
 	}
 	return nil
+}
+
+type writeMetadataStorage struct {
+	writeStorage *WriteStorage
+	mtx          sync.Mutex
+}
+
+func (ms *writeMetadataStorage) Delete(target *scrape.Target, metric string) {
+	//TODO: When a target goes away, there's a chance we might not hear again from it.
+	// When this happens, we need to tell remote-write.
+}
+
+func (ms *writeMetadataStorage) Set(target *scrape.Target, metadata []scrape.MetricMetadata) {
+	for _, queue := range ms.writeStorage.queues {
+		// Blocks  until the sample is sent to all remote write endpoints or closed (because enqueue blocks).
+		queue.AppendMeta(target, metadata)
+	}
 }
 
 type timestampTracker struct {
