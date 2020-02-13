@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/testutil"
@@ -227,5 +228,35 @@ func TestMergeLabels(t *testing.T) {
 		},
 	} {
 		testutil.Equals(t, tc.expected, MergeLabels(tc.primary, tc.secondary))
+	}
+}
+
+func TestMetricTypeToMetricTypeProto(t *testing.T) {
+	tc := []struct {
+		desc     string
+		input    textparse.MetricType
+		expected prompb.MetricMetadata_MetricType
+	}{
+		{
+			desc:     "with a single-word metric",
+			input:    textparse.MetricTypeCounter,
+			expected: prompb.MetricMetadata_COUNTER,
+		},
+		{
+			desc:     "with a two-word metric",
+			input:    textparse.MetricTypeStateset,
+			expected: prompb.MetricMetadata_STATESET,
+		},
+		{
+			desc:     "with an unknown metric",
+			input:    "not-known",
+			expected: prompb.MetricMetadata_UNKNOWN,
+		},
+	}
+	for _, tt := range tc {
+		t.Run(tt.desc, func(t *testing.T) {
+			m := metricTypeToMetricTypeProto(tt.input)
+			testutil.Equals(t, tt.expected, m)
+		})
 	}
 }
