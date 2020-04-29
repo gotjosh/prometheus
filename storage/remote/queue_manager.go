@@ -415,7 +415,7 @@ func (t *QueueManager) sendMetadataWithBackoff(ctx context.Context, metadata []p
 	retry := func() {
 		t.metrics.retriedMetadataTotal.Add(float64(len(metadata)))
 	}
-	err = sendWriteRequestWithBackoff(ctx, t.cfg, t.storeClient, t.logger, req, attemptStore, retry)
+	err = sendWriteRequestWithBackoff(ctx, t.cfg, t.client(), t.logger, req, attemptStore, retry)
 	if err != nil {
 		return err
 	}
@@ -1012,7 +1012,9 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.Ti
 		s.qm.metrics.retriedSamplesTotal.Add(float64(sampleCount))
 	}
 
-	err = sendWriteRequestWithBackoff(ctx, s.qm.cfg, s.qm.storeClient, s.qm.logger, req, attemptStore, retry)
+	s.qm.clientMtx.RLock()
+	err = sendWriteRequestWithBackoff(ctx, s.qm.cfg, s.qm.client(), s.qm.logger, req, attemptStore, retry)
+	s.qm.clientMtx.RUnlock()
 	if err != nil {
 		return err
 	}
