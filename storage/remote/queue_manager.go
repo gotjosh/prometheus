@@ -1059,8 +1059,6 @@ func sendWriteRequestWithBackoff(ctx context.Context, cfg config.QueueConfig, s 
 		try++
 		continue
 	}
-
-	return nil
 }
 
 func buildWriteRequest(samples []prompb.TimeSeries, metadata []prompb.MetricMetadata, buf []byte) ([]byte, int64, error) {
