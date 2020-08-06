@@ -29,6 +29,7 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/relabel"
@@ -50,6 +51,9 @@ const (
 	// We use a label to identify samples and metadata on some metrics. These represent the values they can have.
 	samples  = "samples"
 	metadata = "metadata"
+
+	// Controls how often we collect metadata from the scrape cache.
+	metadataCollectionInterval = model.Duration(5 * time.Minute)
 )
 
 type queueManagerMetrics struct {
@@ -281,7 +285,6 @@ type QueueManager struct {
 	logger          log.Logger
 	flushDeadline   time.Duration
 	cfg             config.QueueConfig
-	mcfg            config.MetadataConfig
 	externalLabels  labels.Labels
 	relabelConfigs  []*relabel.Config
 	watcher         *wal.Watcher
@@ -314,13 +317,12 @@ func NewQueueManager(
 	logger log.Logger,
 	walDir string,
 	samplesIn *ewmaRate,
-	mCfg config.MetadataConfig,
 	cfg config.QueueConfig,
 	externalLabels labels.Labels,
 	relabelConfigs []*relabel.Config,
 	client WriteClient,
 	flushDeadline time.Duration,
-	sm scrape.ReadyManager,
+	sm ReadyScrapeManager,
 ) *QueueManager {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -331,7 +333,6 @@ func NewQueueManager(
 		logger:         logger,
 		flushDeadline:  flushDeadline,
 		cfg:            cfg,
-		mcfg:           mCfg,
 		externalLabels: externalLabels,
 		relabelConfigs: relabelConfigs,
 		storeClient:    client,
@@ -353,15 +354,13 @@ func NewQueueManager(
 	}
 
 	t.watcher = wal.NewWatcher(watcherMetrics, readerMetrics, logger, client.Name(), t, walDir)
-	if t.mcfg.Send {
-		t.metadataWatcher = NewMetadataWatcher(logger, sm, client.Name(), t, t.mcfg.SendInterval, flushDeadline)
-	}
+	t.metadataWatcher = NewMetadataWatcher(logger, sm, client.Name(), t, metadataCollectionInterval, flushDeadline)
 	t.shards = t.newShards()
 
 	return t
 }
 
-// AppendMetadata queues metadata to be sent to the remote storage. Metadata is sent all at once and is not parallelized.
+// AppendMetadata sends metadata to the remote storage.
 func (t *QueueManager) AppendMetadata(ctx context.Context, metadata []scrape.MetricMetadata) {
 	mm := make([]prompb.MetricMetadata, 0, len(metadata))
 	for _, entry := range metadata {
@@ -482,9 +481,7 @@ func (t *QueueManager) Start() {
 
 	t.shards.start(t.numShards)
 	t.watcher.Start()
-	if t.mcfg.Send {
-		t.metadataWatcher.Start()
-	}
+	t.metadataWatcher.Start()
 
 	t.wg.Add(2)
 	go t.updateShardsLoop()
@@ -504,9 +501,7 @@ func (t *QueueManager) Stop() {
 	// causes a closed channel panic.
 	t.shards.stop()
 	t.watcher.Stop()
-	if t.mcfg.Send {
-		t.metadataWatcher.Stop()
-	}
+	t.metadataWatcher.Stop()
 
 	// On shutdown, release the strings in the labels from the intern pool.
 	t.seriesMtx.Lock()

@@ -24,7 +24,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/wal"
 )
@@ -59,11 +58,11 @@ type WriteStorage struct {
 	queues            map[string]*QueueManager
 	samplesIn         *ewmaRate
 	flushDeadline     time.Duration
-	scraper           scrape.ReadyManager
+	scraper           ReadyScrapeManager
 }
 
 // NewWriteStorage creates and runs a WriteStorage.
-func NewWriteStorage(logger log.Logger, reg prometheus.Registerer, walDir string, flushDeadline time.Duration, sm scrape.ReadyManager) *WriteStorage {
+func NewWriteStorage(logger log.Logger, reg prometheus.Registerer, walDir string, flushDeadline time.Duration, sm ReadyScrapeManager) *WriteStorage {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -148,7 +147,6 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 			rws.logger,
 			rws.walDir,
 			rws.samplesIn,
-			rwConf.MetadataConfig,
 			rwConf.QueueConfig,
 			conf.GlobalConfig.ExternalLabels,
 			rwConf.WriteRelabelConfigs,
